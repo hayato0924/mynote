@@ -734,7 +734,7 @@ function SettingsTab({ data, update }) {
       </div>
 
       <div style={{ textAlign: "center", fontSize: 11, color: "var(--faded)", margin: "24px 0 8px", letterSpacing: "0.2em" }}>
-        夢見手帖 ver.1.2(ローカル版)
+        夢見手帖 ver.1.2.1(ローカル版)
       </div>
     </div>
   );
@@ -1003,7 +1003,8 @@ const S = {
   fab: {
     position: "fixed",
     right: "max(18px, calc(50% - 240px + 18px))",
-    bottom: 78,
+    // 下タブバーの高さ + iPhoneのホームバー領域(safe-area)ぶん持ち上げる
+    bottom: "calc(76px + env(safe-area-inset-bottom, 0px))",
     width: 54,
     height: 54,
     borderRadius: "50%",
