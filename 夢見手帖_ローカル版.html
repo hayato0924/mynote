@@ -1,0 +1,1070 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>夢見手帖</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #1E4B39; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+/* ============================================================
+   夢見手帖 — 企画人・VTuber向けセルフマネージャー
+   ------------------------------------------------------------
+   構成(改良しやすいようにセクション分け):
+   1. 定数・テーマ      : カテゴリ/デフォルト値。項目追加はここ
+   2. 日付ユーティリティ : 純粋関数のみ。テストしやすい
+   3. データ層(useAppData): 保存/読込を一箇所に集約
+   4. 共通UI部品        : Sheet(モーダル), Chip, Field など
+   5. 各タブ画面        : Home / Calendar / Memo / Settings
+   6. App(ルート)       : タブ切替とデータ配線のみ
+   ============================================================ */
+
+/* ---------- 1. 定数・テーマ ---------- */
+
+const STORAGE_KEY = "yumemi-techo-v1";
+
+const CATEGORIES = [
+  { id: "stream",  label: "配信",   color: "#C73A2C" },
+  { id: "school",  label: "学校",   color: "#4C5F8A" },
+  { id: "baito",   label: "バイト", color: "#B8862B" },
+  { id: "vrchat",  label: "VRChat", color: "#6E4F8A" },
+  { id: "record",  label: "収録",   color: "#1E4B39" },
+  { id: "create",  label: "制作",   color: "#7A5C3E" },
+  { id: "rest",    label: "休息",   color: "#5E8C6E" },
+  { id: "other",   label: "その他", color: "#8A857B" },
+];
+// 見つからない種別(廃止したコラボ/イベント等)は「その他」として表示
+const catOf = (id) => CATEGORIES.find((c) => c.id === id) || CATEGORIES.find((c) => c.id === "other");
+
+const DEFAULT_GENRES = ["配信ネタ", "企画", "ワールド制作", "動画", "その他"];
+
+const DEFAULT_DATA = {
+  events: [],   // {id, title, date:"YYYY-MM-DD", time:"HH:MM"|"", category, note}
+  memos: [],    // {id, genre, title, body, updatedAt}
+  genres: DEFAULT_GENRES,
+  settings: { weeklyLimit: 5 }, // 1週間の稼働上限(休息を除く件数)
+};
+
+const WEEKDAYS_JA = ["日", "月", "火", "水", "木", "金", "土"];
+
+/* ---------- 2. 日付ユーティリティ ---------- */
+
+const pad = (n) => String(n).padStart(2, "0");
+const toKey = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const fromKey = (k) => {
+  const [y, m, d] = k.split("-").map(Number);
+  return new Date(y, m - 1, d);
+};
+const todayKey = () => toKey(new Date());
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+const daysUntil = (key) => {
+  const a = fromKey(todayKey()), b = fromKey(key);
+  return Math.round((b - a) / 86400000);
+};
+const formatJa = (key) => {
+  const d = fromKey(key);
+  return `${d.getMonth() + 1}月${d.getDate()}日(${WEEKDAYS_JA[d.getDay()]})`;
+};
+// その週の月曜を返す(週稼働の集計単位)
+const mondayOf = (d) => addDays(d, -((d.getDay() + 6) % 7));
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+// 全データをJSONファイルとして端末に保存(ファイルアプリ等に落ちる)
+const downloadBackup = (data) => {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `yumemi-techo_backup_${todayKey()}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+
+/* ---------- 3. データ層 ---------- */
+
+// 保存の三重化(ローカル版):
+//  1) 毎回 localStorage と IndexedDB の両方へ保存(片方が消えてももう片方から復元)
+//  2) navigator.storage.persist() でブラウザに「このデータは消さないで」と申請
+//  3) 7日以上バックアップを取っていないと、ホーム画面で控えの保存を促す
+// 将来クラウド同期に戻す場合は storageAdapter の中身だけ差し替えればOK。
+
+const idb = {
+  _db: null,
+  async open() {
+    if (this._db) return this._db;
+    this._db = await new Promise((res, rej) => {
+      const req = indexedDB.open("yumemi-techo", 1);
+      req.onupgradeneeded = () => req.result.createObjectStore("kv");
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    return this._db;
+  },
+  async get(key) {
+    const db = await this.open();
+    return new Promise((res, rej) => {
+      const r = db.transaction("kv", "readonly").objectStore("kv").get(key);
+      r.onsuccess = () => res(r.result === undefined ? null : r.result);
+      r.onerror = () => rej(r.error);
+    });
+  },
+  async set(key, value) {
+    const db = await this.open();
+    return new Promise((res, rej) => {
+      const r = db.transaction("kv", "readwrite").objectStore("kv").put(value, key);
+      r.onsuccess = () => res(true);
+      r.onerror = () => rej(r.error);
+    });
+  },
+};
+
+const storageAdapter = {
+  async get(key) {
+    const found = [];
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw !== null) {
+        const p = JSON.parse(raw);
+        // 旧形式(素のデータJSON)にも対応
+        found.push(p && p.__env ? p : { __env: true, savedAt: 0, value: raw });
+      }
+    } catch {}
+    try {
+      const p = await idb.get(key);
+      if (p && p.__env) found.push(p);
+    } catch {}
+    if (found.length === 0) return null;
+    found.sort((a, b) => b.savedAt - a.savedAt); // 新しい方を採用
+    return { key, value: found[0].value };
+  },
+  async set(key, value) {
+    const env = { __env: true, savedAt: Date.now(), value };
+    let ok = false;
+    try { localStorage.setItem(key, JSON.stringify(env)); ok = true; } catch {}
+    try { await idb.set(key, env); ok = true; } catch (e) { if (!ok) throw e; }
+    if (!ok) throw new Error("save failed");
+    return { key, value };
+  },
+};
+
+function useAppData() {
+  const [data, setData] = useState(null); // null = 読込中
+  const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
+  const timer = useRef(null);
+  const loaded = useRef(false);
+
+  // 初回読込
+  useEffect(() => {
+    (async () => {
+      // ブラウザに保存領域の永続化を申請(対応ブラウザのみ・失敗しても無害)
+      try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch {}
+      try {
+        const res = await storageAdapter.get(STORAGE_KEY);
+        const parsed = res ? JSON.parse(res.value) : DEFAULT_DATA;
+        setData({ ...DEFAULT_DATA, ...parsed, settings: { ...DEFAULT_DATA.settings, ...(parsed.settings || {}) } });
+      } catch {
+        setData(DEFAULT_DATA); // 初回起動(キーが無い)もここに来る
+      } finally {
+        loaded.current = true;
+      }
+    })();
+  }, []);
+
+  // 変更を自動保存(500msデバウンス)
+  useEffect(() => {
+    if (!loaded.current || data === null) return;
+    setSaveState("saving");
+    clearTimeout(timer.current);
+    timer.current = setTimeout(async () => {
+      try {
+        await storageAdapter.set(STORAGE_KEY, JSON.stringify(data));
+        setSaveState("saved");
+        setTimeout(() => setSaveState("idle"), 1500);
+      } catch {
+        setSaveState("error");
+      }
+    }, 500);
+    return () => clearTimeout(timer.current);
+  }, [data]);
+
+  const update = useCallback((patch) => setData((d) => ({ ...d, ...patch })), []);
+  return { data, update, saveState };
+}
+
+/* ---------- 4. 共通UI部品 ---------- */
+
+function Sheet({ title, onClose, children }) {
+  return (
+    <div style={S.sheetBack} onClick={onClose}>
+      <div style={S.sheet} onClick={(e) => e.stopPropagation()}>
+        <div style={S.sheetHead}>
+          <span style={S.sheetTitle}>{title}</span>
+          <button style={S.iconBtn} onClick={onClose} aria-label="閉じる">✕</button>
+        </div>
+        <div style={{ padding: "4px 18px 24px" }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label style={{ display: "block", marginBottom: 14 }}>
+      <div style={S.fieldLabel}>{label}</div>
+      {children}
+    </label>
+  );
+}
+
+function Chip({ active, color, onClick, children }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        ...S.chip,
+        background: active ? (color || "var(--green)") : "transparent",
+        color: active ? "#F4EDDC" : "var(--ink)",
+        borderColor: active ? (color || "var(--green)") : "var(--line)",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function CatDot({ id, size = 8 }) {
+  return <span style={{ display: "inline-block", width: size, height: size, borderRadius: "50%", background: catOf(id).color, flexShrink: 0 }} />;
+}
+
+function EventRow({ ev, onClick }) {
+  return (
+    <button style={S.eventRow} onClick={onClick}>
+      <CatDot id={ev.category} />
+      <span style={{ fontFamily: "var(--mincho)", fontSize: 13, color: "var(--faded)", minWidth: 44, textAlign: "left" }}>
+        {ev.time || "終日"}
+      </span>
+      <span style={{ flex: 1, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ev.title}</span>
+      <span style={{ fontSize: 11, color: catOf(ev.category).color }}>{catOf(ev.category).label}</span>
+    </button>
+  );
+}
+
+/* ---------- 5-1. ホーム(今日) ---------- */
+
+function HomeTab({ data, update, openEvent }) {
+  // 7日以上控えを取っていなければ促す(データが空のうちは出さない)
+  const hasContent = data.events.length + data.memos.length > 0;
+  const lastBk = data.settings.lastBackupAt || 0;
+  const needBackup = hasContent && Date.now() - lastBk > 7 * 86400000;
+  const takeBackup = () => {
+    downloadBackup(data);
+    update({ settings: { ...data.settings, lastBackupAt: Date.now() } });
+  };
+  const tKey = todayKey();
+  const today = fromKey(tKey);
+  const byDay = (n) =>
+    data.events
+      .filter((e) => daysUntil(e.date) === n)
+      .sort((a, b) => (a.time || "99").localeCompare(b.time || "99"));
+
+  const todays = byDay(0), tomorrow = byDay(1), dayAfter = byDay(2);
+
+  // 今週の稼働(休息を除く)
+  const mon = mondayOf(today);
+  const weekKeys = Array.from({ length: 7 }, (_, i) => toKey(addDays(mon, i)));
+  const weekEvents = data.events.filter((e) => weekKeys.includes(e.date) && e.category !== "rest");
+  const hasRest = data.events.some((e) => weekKeys.includes(e.date) && e.category === "rest");
+  const limit = data.settings.weeklyLimit;
+  const ratio = Math.min(weekEvents.length / limit, 1.4);
+  const loadMsg =
+    weekEvents.length > limit
+      ? "詰めすぎ注意。どれか1つ、来週に回せませんか?"
+      : weekEvents.length === limit
+      ? "上限ちょうど。これ以上は入れないのが吉です。"
+      : "余裕あり。いいペースです。";
+
+  const remindGroup = (label, list, tone) =>
+    list.length > 0 && (
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ ...S.remindTag, background: tone }}>{label}</div>
+        {list.map((ev) => <EventRow key={ev.id} ev={ev} onClick={() => openEvent(ev)} />)}
+      </div>
+    );
+
+  return (
+    <div>
+      {needBackup && (
+        <button style={S.backupBanner} onClick={takeBackup}>
+          しばらく控えを取っていません。タップしてバックアップファイルを保存 →
+        </button>
+      )}
+      {/* 日めくりカード */}
+      <div style={S.himekuri}>
+        <div style={S.himekuriHoles}>{Array.from({ length: 9 }).map((_, i) => <span key={i} style={S.hole} />)}</div>
+        <div style={{ textAlign: "center", padding: "14px 0 6px" }}>
+          <div style={{ fontSize: 13, letterSpacing: "0.3em", color: "var(--faded)" }}>
+            {today.getFullYear()}年 {today.getMonth() + 1}月
+          </div>
+          <div style={{ fontFamily: "var(--mincho)", fontSize: 84, lineHeight: 1.05, fontWeight: 600, color: today.getDay() === 0 ? "var(--shu)" : "var(--ink)" }}>
+            {today.getDate()}
+          </div>
+          <div style={{ fontFamily: "var(--mincho)", fontSize: 16, letterSpacing: "0.5em", marginLeft: "0.5em" }}>
+            {WEEKDAYS_JA[today.getDay()]}曜日
+          </div>
+        </div>
+        <div style={{ borderTop: "1px dashed var(--line)", padding: "10px 14px 12px" }}>
+          {todays.length === 0 ? (
+            <div style={{ textAlign: "center", fontSize: 13, color: "var(--faded)" }}>本日の予定なし ── 骨休めも仕事のうち</div>
+          ) : (
+            todays.map((ev) => <EventRow key={ev.id} ev={ev} onClick={() => openEvent(ev)} />)
+          )}
+        </div>
+      </div>
+
+      {/* リマインド */}
+      <div style={S.sectionHead}>お知らせ</div>
+      {todays.length + tomorrow.length + dayAfter.length === 0 ? (
+        <div style={S.empty}>2日先までの予定はありません。</div>
+      ) : (
+        <div style={S.card}>
+          {remindGroup("本日", todays, "var(--shu)")}
+          {remindGroup("明日", tomorrow, "var(--karashi)")}
+          {remindGroup("明後日", dayAfter, "var(--green)")}
+        </div>
+      )}
+
+      {/* 今週の稼働 */}
+      <div style={S.sectionHead}>今週の稼働</div>
+      <div style={S.card}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+          <span style={{ fontFamily: "var(--mincho)", fontSize: 24 }}>
+            {weekEvents.length}<span style={{ fontSize: 13, color: "var(--faded)" }}> / {limit} 件</span>
+          </span>
+          <span style={{ fontSize: 12, color: weekEvents.length > limit ? "var(--shu)" : "var(--faded)" }}>{loadMsg}</span>
+        </div>
+        <div style={{ height: 10, background: "rgba(42,38,32,0.08)", borderRadius: 5, overflow: "hidden" }}>
+          <div style={{ width: `${Math.min(ratio, 1) * 100}%`, height: "100%", background: weekEvents.length > limit ? "var(--shu)" : "var(--green)", transition: "width .4s" }} />
+        </div>
+        {!hasRest && weekEvents.length >= limit - 1 && (
+          <div style={{ marginTop: 10, fontSize: 12, color: "var(--shu)" }}>
+            ※ 今週「休息」の予定がありません。1日入れておくことをおすすめします。
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- 5-2. 予定表(月間・週間) ---------- */
+
+function CalendarTab({ data, openEvent, openNew }) {
+  const now = new Date();
+  const [view, setView] = useState("month"); // "month" | "week"
+  const [ym, setYm] = useState({ y: now.getFullYear(), m: now.getMonth() });
+  const [selected, setSelected] = useState(todayKey());
+  const [weekStart, setWeekStart] = useState(toKey(mondayOf(new Date())));
+
+  const eventsOf = (key) =>
+    data.events
+      .filter((e) => e.date === key)
+      .sort((a, b) => (a.time || "99").localeCompare(b.time || "99"));
+
+  /* --- 月間ビュー用 --- */
+  const first = new Date(ym.y, ym.m, 1);
+  const startPad = first.getDay();
+  const daysInMonth = new Date(ym.y, ym.m + 1, 0).getDate();
+  const cells = [
+    ...Array.from({ length: startPad }, () => null),
+    ...Array.from({ length: daysInMonth }, (_, i) => toKey(new Date(ym.y, ym.m, i + 1))),
+  ];
+  const move = (n) => {
+    const d = new Date(ym.y, ym.m + n, 1);
+    setYm({ y: d.getFullYear(), m: d.getMonth() });
+  };
+  const dayEvents = eventsOf(selected);
+
+  /* --- 週間ビュー用(月曜はじまり) --- */
+  const weekDays = Array.from({ length: 7 }, (_, i) => toKey(addDays(fromKey(weekStart), i)));
+  const moveWeek = (n) => setWeekStart(toKey(addDays(fromKey(weekStart), n * 7)));
+  const isThisWeek = weekStart === toKey(mondayOf(new Date()));
+
+  return (
+    <div>
+      {/* ビュー切り替え */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+        <Chip active={view === "month"} onClick={() => setView("month")}>月間</Chip>
+        <Chip active={view === "week"} onClick={() => setView("week")}>週間</Chip>
+      </div>
+
+      {view === "month" ? (
+        <>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <button style={S.navBtn} onClick={() => move(-1)}>‹ 前月</button>
+            <span style={{ fontFamily: "var(--mincho)", fontSize: 20, letterSpacing: "0.1em" }}>
+              {ym.y}年 {ym.m + 1}月
+            </span>
+            <button style={S.navBtn} onClick={() => move(1)}>翌月 ›</button>
+          </div>
+
+          <div style={S.card}>
+            <div style={S.calGrid}>
+              {WEEKDAYS_JA.map((w, i) => (
+                <div key={w} style={{ ...S.calHead, color: i === 0 ? "var(--shu)" : i === 6 ? "#4C5F8A" : "var(--faded)" }}>{w}</div>
+              ))}
+              {cells.map((key, i) =>
+                key === null ? (
+                  <div key={`p${i}`} />
+                ) : (
+                  <button
+                    key={key}
+                    onClick={() => setSelected(key)}
+                    style={{
+                      ...S.calCell,
+                      background: key === selected ? "rgba(30,75,57,0.12)" : "transparent",
+                      outline: key === todayKey() ? "2px solid var(--shu)" : "none",
+                      outlineOffset: -2,
+                    }}
+                  >
+                    <span style={{ fontSize: 13, color: fromKey(key).getDay() === 0 ? "var(--shu)" : fromKey(key).getDay() === 6 ? "#4C5F8A" : "var(--ink)" }}>
+                      {fromKey(key).getDate()}
+                    </span>
+                    <span style={{ display: "flex", gap: 2, justifyContent: "center", marginTop: 2, minHeight: 6 }}>
+                      {eventsOf(key).slice(0, 3).map((e) => <CatDot key={e.id} id={e.category} size={5} />)}
+                    </span>
+                  </button>
+                )
+              )}
+            </div>
+          </div>
+
+          <div style={S.sectionHead}>{formatJa(selected)}</div>
+          <div style={S.card}>
+            {dayEvents.length === 0 ? (
+              <div style={{ fontSize: 13, color: "var(--faded)", padding: "4px 0 10px" }}>予定はありません。</div>
+            ) : (
+              dayEvents.map((ev) => <EventRow key={ev.id} ev={ev} onClick={() => openEvent(ev)} />)
+            )}
+            <button style={S.primaryBtn} onClick={() => openNew(selected)}>＋ この日に予定を追加</button>
+          </div>
+        </>
+      ) : (
+        <>
+          {/* 週間ビュー: VTuberの週間スケジュール風 */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <button style={S.navBtn} onClick={() => moveWeek(-1)}>‹ 前週</button>
+            <span style={{ fontFamily: "var(--mincho)", fontSize: 15 }}>
+              {formatJa(weekDays[0])} 〜 {formatJa(weekDays[6])}
+            </span>
+            <button style={S.navBtn} onClick={() => moveWeek(1)}>翌週 ›</button>
+          </div>
+          {!isThisWeek && (
+            <button style={{ ...S.navBtn, width: "100%", marginBottom: 10 }} onClick={() => setWeekStart(toKey(mondayOf(new Date())))}>
+              今週へ戻る
+            </button>
+          )}
+
+          {weekDays.map((key) => {
+            const d = fromKey(key);
+            const evs = eventsOf(key);
+            const isToday = key === todayKey();
+            return (
+              <div key={key} style={{ ...S.card, padding: "8px 12px", borderLeft: `4px solid ${isToday ? "var(--shu)" : "var(--line)"}`, marginBottom: 8 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontFamily: "var(--mincho)", fontSize: 15 }}>
+                    <span style={{ color: d.getDay() === 0 ? "var(--shu)" : d.getDay() === 6 ? "#4C5F8A" : "var(--ink)" }}>
+                      {d.getMonth() + 1}/{d.getDate()}({WEEKDAYS_JA[d.getDay()]})
+                    </span>
+                    {isToday && <span style={{ fontSize: 10, color: "var(--shu)", marginLeft: 6, letterSpacing: "0.15em" }}>本日</span>}
+                  </span>
+                  <button style={{ ...S.iconBtn, color: "var(--green)", fontSize: 18 }} onClick={() => openNew(key)} aria-label={`${d.getMonth() + 1}月${d.getDate()}日に予定を追加`}>＋</button>
+                </div>
+                {evs.length === 0 ? (
+                  <div style={{ fontSize: 12, color: "var(--faded)", padding: "0 0 4px" }}>—</div>
+                ) : (
+                  evs.map((ev) => <EventRow key={ev.id} ev={ev} onClick={() => openEvent(ev)} />)
+                )}
+              </div>
+            );
+          })}
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ---------- 5-3. 予定の追加・編集シート ---------- */
+
+function EventSheet({ initial, onSave, onDelete, onClose }) {
+  const [f, setF] = useState(initial);
+  const [repeat, setRepeat] = useState(false);       // 毎週くり返すか(新規のみ)
+  const [repeatUntil, setRepeatUntil] = useState(""); // いつまで
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  const isNew = !initial.id;
+  const canSave = f.title.trim() && f.date && (!repeat || repeatUntil);
+
+  const turnOnRepeat = () => {
+    setRepeat(true);
+    if (!repeatUntil) {
+      const base = f.date ? fromKey(f.date) : new Date();
+      setRepeatUntil(toKey(addDays(base, 56))); // 初期値: 8週間先まで
+    }
+  };
+
+  return (
+    <Sheet title={isNew ? "予定を追加" : "予定を編集"} onClose={onClose}>
+      <Field label="内容"><input style={S.input} value={f.title} onChange={set("title")} placeholder="例: 夢見祭 打ち合わせ" /></Field>
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 1 }}><Field label="日付"><input type="date" style={S.input} value={f.date} onChange={set("date")} /></Field></div>
+        <div style={{ flex: 1 }}><Field label="時刻(任意)"><input type="time" style={S.input} value={f.time} onChange={set("time")} /></Field></div>
+      </div>
+      <Field label="種別">
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {CATEGORIES.map((c) => (
+            <Chip key={c.id} active={f.category === c.id} color={c.color} onClick={() => setF({ ...f, category: c.id })}>{c.label}</Chip>
+          ))}
+        </div>
+      </Field>
+
+      {isNew && (
+        <Field label="くり返し">
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            <Chip active={!repeat} onClick={() => setRepeat(false)}>1回のみ</Chip>
+            <Chip active={repeat} onClick={turnOnRepeat}>毎週同じ曜日</Chip>
+          </div>
+          {repeat && (
+            <div style={{ marginTop: 10 }}>
+              <div style={S.fieldLabel}>いつまで(この日まで毎週作成)</div>
+              <input type="date" style={S.input} value={repeatUntil} min={f.date} onChange={(e) => setRepeatUntil(e.target.value)} />
+              <div style={{ fontSize: 11, color: "var(--faded)", marginTop: 6 }}>
+                1件ずつ独立した予定として作られるので、あとから個別に編集・削除できます。
+              </div>
+            </div>
+          )}
+        </Field>
+      )}
+
+      <Field label="備考(任意)"><textarea style={{ ...S.input, minHeight: 60 }} value={f.note} onChange={set("note")} /></Field>
+      <button
+        style={{ ...S.primaryBtn, opacity: canSave ? 1 : 0.4 }}
+        onClick={() => canSave && onSave(f, isNew && repeat ? repeatUntil : null)}
+      >
+        {isNew && repeat ? "毎週の予定をまとめて作成" : "保存する"}
+      </button>
+      {!isNew && <button style={S.dangerBtn} onClick={() => onDelete(f.id)}>この予定を削除</button>}
+    </Sheet>
+  );
+}
+
+/* ---------- 5-4. 覚え書き(メモ) ---------- */
+
+function MemoTab({ data, update }) {
+  const [genre, setGenre] = useState("すべて");
+  const [editing, setEditing] = useState(null); // memo object or null
+  const [newGenre, setNewGenre] = useState("");
+
+  const memos = data.memos
+    .filter((m) => genre === "すべて" || m.genre === genre)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+
+  const saveMemo = (m) => {
+    const memo = { ...m, updatedAt: Date.now() };
+    update({
+      memos: m.id
+        ? data.memos.map((x) => (x.id === m.id ? memo : x))
+        : [...data.memos, { ...memo, id: uid() }],
+    });
+    setEditing(null);
+  };
+  const addGenre = () => {
+    const g = newGenre.trim();
+    if (g && !data.genres.includes(g)) update({ genres: [...data.genres, g] });
+    setNewGenre("");
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+        {["すべて", ...data.genres].map((g) => (
+          <Chip key={g} active={genre === g} onClick={() => setGenre(g)}>{g}</Chip>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+        <input style={{ ...S.input, flex: 1 }} placeholder="新しいジャンル名" value={newGenre} onChange={(e) => setNewGenre(e.target.value)} />
+        <button style={{ ...S.navBtn, whiteSpace: "nowrap" }} onClick={addGenre}>追加</button>
+      </div>
+
+      {memos.length === 0 ? (
+        <div style={S.empty}>まだ覚え書きがありません。思いついたら即メモ。</div>
+      ) : (
+        memos.map((m) => (
+          <button key={m.id} style={S.memoCard} onClick={() => setEditing(m)}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+              <span style={{ fontSize: 11, color: "var(--green)", border: "1px solid var(--line)", borderRadius: 3, padding: "1px 6px" }}>{m.genre}</span>
+              <span style={{ fontSize: 11, color: "var(--faded)" }}>{new Date(m.updatedAt).toLocaleDateString("ja-JP")}</span>
+            </div>
+            <div style={{ fontWeight: 600, marginBottom: 2, textAlign: "left" }}>{m.title || "(無題)"}</div>
+            <div style={{ fontSize: 12, color: "var(--faded)", textAlign: "left", overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
+              {m.body}
+            </div>
+          </button>
+        ))
+      )}
+
+      <button style={S.fab} onClick={() => setEditing({ genre: data.genres[0] || "その他", title: "", body: "" })} aria-label="覚え書きを追加">＋</button>
+
+      {editing && (
+        <Sheet title={editing.id ? "覚え書きを編集" : "覚え書きを追加"} onClose={() => setEditing(null)}>
+          <Field label="ジャンル">
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {data.genres.map((g) => (
+                <Chip key={g} active={editing.genre === g} onClick={() => setEditing({ ...editing, genre: g })}>{g}</Chip>
+              ))}
+            </div>
+          </Field>
+          <Field label="見出し"><input style={S.input} value={editing.title} onChange={(e) => setEditing({ ...editing, title: e.target.value })} /></Field>
+          <Field label="本文">
+            <textarea style={{ ...S.input, minHeight: 140 }} value={editing.body} onChange={(e) => setEditing({ ...editing, body: e.target.value })} placeholder="アイデア、ネタ、段取り、なんでも" />
+          </Field>
+          <button style={S.primaryBtn} onClick={() => saveMemo(editing)}>保存する</button>
+          {editing.id && (
+            <button style={S.dangerBtn} onClick={() => { update({ memos: data.memos.filter((x) => x.id !== editing.id) }); setEditing(null); }}>
+              この覚え書きを削除
+            </button>
+          )}
+        </Sheet>
+      )}
+    </div>
+  );
+}
+
+/* ---------- 5-5. 設定 ---------- */
+
+function SettingsTab({ data, update }) {
+  const [importText, setImportText] = useState("");
+  const [msg, setMsg] = useState("");
+  const limit = data.settings.weeklyLimit;
+  const setLimit = (n) => update({ settings: { ...data.settings, weeklyLimit: Math.max(1, Math.min(21, n)) } });
+
+  const doImport = () => {
+    try {
+      const parsed = JSON.parse(importText);
+      if (!parsed.events || !parsed.memos) throw new Error();
+      update(parsed);
+      setMsg("読み込みました。");
+      setImportText("");
+    } catch {
+      setMsg("読み込めませんでした。書き出したデータをそのまま貼り付けてください。");
+    }
+  };
+
+  return (
+    <div>
+      <div style={S.sectionHead}>稼働の上限</div>
+      <div style={S.card}>
+        <div style={{ fontSize: 13, color: "var(--faded)", marginBottom: 10 }}>
+          1週間に入れる予定(休息を除く)の上限。超えるとホームで注意します。
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 16, justifyContent: "center" }}>
+          <button style={S.navBtn} onClick={() => setLimit(limit - 1)}>−</button>
+          <span style={{ fontFamily: "var(--mincho)", fontSize: 32 }}>{limit}<span style={{ fontSize: 14 }}> 件</span></span>
+          <button style={S.navBtn} onClick={() => setLimit(limit + 1)}>＋</button>
+        </div>
+      </div>
+
+      <div style={S.sectionHead}>バックアップ</div>
+      <div style={S.card}>
+        <div style={{ fontSize: 13, color: "var(--faded)", marginBottom: 10 }}>
+          データはこの端末内の2箇所に自動保存されます。さらに万一に備え、定期的にバックアップファイルを保存してください(7日空くとホームでお知らせします)。
+        </div>
+        <div style={{ fontSize: 12, color: "var(--faded)", marginBottom: 8 }}>
+          最終バックアップ: {data.settings.lastBackupAt ? new Date(data.settings.lastBackupAt).toLocaleDateString("ja-JP") : "まだ取っていません"}
+        </div>
+        <button
+          style={S.primaryBtn}
+          onClick={() => {
+            downloadBackup(data);
+            update({ settings: { ...data.settings, lastBackupAt: Date.now() } });
+            setMsg("バックアップファイルを保存しました。");
+          }}
+        >
+          バックアップファイルを保存
+        </button>
+        <Field label={"\u00A0"}>
+          <div style={S.fieldLabel}>バックアップファイルから復元</div>
+          <input
+            type="file"
+            accept=".json,application/json"
+            style={{ ...S.input, padding: "8px 10px" }}
+            onChange={(e) => {
+              const f = e.target.files && e.target.files[0];
+              if (!f) return;
+              const r = new FileReader();
+              r.onload = () => {
+                try {
+                  const parsed = JSON.parse(r.result);
+                  if (!parsed.events || !parsed.memos) throw new Error();
+                  update(parsed);
+                  setMsg("復元しました。");
+                } catch {
+                  setMsg("このファイルは読み込めませんでした。バックアップファイルを選んでください。");
+                }
+              };
+              r.readAsText(f);
+              e.target.value = "";
+            }}
+          />
+        </Field>
+        <Field label="文字での読み込み(書き出したデータを貼り付け)">
+          <textarea style={{ ...S.input, minHeight: 70, fontSize: 11 }} value={importText} onChange={(e) => setImportText(e.target.value)} />
+        </Field>
+        <button style={S.navBtn} onClick={doImport}>読み込む</button>
+        {msg && <div style={{ marginTop: 8, fontSize: 12, color: "var(--green)" }}>{msg}</div>}
+      </div>
+
+      <div style={{ textAlign: "center", fontSize: 11, color: "var(--faded)", margin: "24px 0 8px", letterSpacing: "0.2em" }}>
+        夢見手帖 ver.1.2(ローカル版)
+      </div>
+    </div>
+  );
+}
+
+/* ---------- 6. App(ルート) ---------- */
+
+const TABS = [
+  { id: "home", label: "今日", icon: "☀" },
+  { id: "cal", label: "予定表", icon: "📅" },
+  { id: "memo", label: "覚え書き", icon: "✎" },
+  { id: "set", label: "設定", icon: "⚙" },
+];
+
+function App() {
+  const { data, update, saveState } = useAppData();
+  const [tab, setTab] = useState("home");
+  const [eventForm, setEventForm] = useState(null); // 編集中の予定 or null
+
+  const openNew = (date) => setEventForm({ title: "", date: date || todayKey(), time: "", category: "stream", note: "" });
+  const openEvent = (ev) => setEventForm({ ...ev });
+
+  const saveEvent = (f, repeatUntil) => {
+    if (!f.id && repeatUntil) {
+      // 毎週くり返し: 終了日まで7日おきに、それぞれ独立した予定として作成
+      const batch = [];
+      let d = fromKey(f.date);
+      const end = fromKey(repeatUntil);
+      let guard = 0;
+      while (d <= end && guard < 54) { // 暴走防止(約1年分まで)
+        batch.push({ ...f, id: uid() + guard.toString(36), date: toKey(d) });
+        d = addDays(d, 7);
+        guard++;
+      }
+      update({ events: [...data.events, ...batch] });
+    } else {
+      update({
+        events: f.id
+          ? data.events.map((e) => (e.id === f.id ? f : e))
+          : [...data.events, { ...f, id: uid() }],
+      });
+    }
+    setEventForm(null);
+  };
+  const deleteEvent = (id) => {
+    update({ events: data.events.filter((e) => e.id !== id) });
+    setEventForm(null);
+  };
+
+  return (
+    <div style={S.root}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@500;600&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap');
+        :root {
+          --paper: #F2EBD8; --ink: #2A2620; --faded: #8A8272;
+          --green: #1E4B39; --green-deep: #143528;
+          --shu: #C73A2C; --karashi: #B8862B;
+          --line: rgba(42,38,32,0.22);
+          --mincho: 'Shippori Mincho', 'Hiragino Mincho ProN', 'Yu Mincho', serif;
+          --gothic: 'Zen Kaku Gothic New', 'Hiragino Kaku Gothic ProN', sans-serif;
+        }
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        button { font-family: var(--gothic); cursor: pointer; }
+        input, textarea { font-family: var(--gothic); }
+        input:focus, textarea:focus, button:focus-visible { outline: 2px solid var(--green); outline-offset: 1px; }
+        @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+      `}</style>
+
+      <div style={S.frame}>
+        {/* ヘッダー */}
+        <header style={S.header}>
+          <span style={{ fontFamily: "var(--mincho)", fontSize: 18, letterSpacing: "0.35em", marginLeft: "0.35em" }}>夢見手帖</span>
+          <span style={{ fontSize: 10, opacity: 0.75 }}>
+            {saveState === "saving" ? "保存中…" : saveState === "saved" ? "保存しました" : saveState === "error" ? "保存に失敗" : ""}
+          </span>
+        </header>
+
+        {/* 本文 */}
+        <main style={S.main}>
+          {data === null ? (
+            <div style={{ textAlign: "center", padding: "80px 0", color: "var(--faded)", fontFamily: "var(--mincho)" }}>帳面をひらいています…</div>
+          ) : (
+            <>
+              {tab === "home" && <HomeTab data={data} update={update} openEvent={openEvent} />}
+              {tab === "cal" && <CalendarTab data={data} openEvent={openEvent} openNew={openNew} />}
+              {tab === "memo" && <MemoTab data={data} update={update} />}
+              {tab === "set" && <SettingsTab data={data} update={update} />}
+            </>
+          )}
+        </main>
+
+        {/* 下部タブ */}
+        <nav style={S.tabbar}>
+          {TABS.map((t) => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{ ...S.tabBtn, opacity: tab === t.id ? 1 : 0.55, borderTop: tab === t.id ? "3px solid var(--karashi)" : "3px solid transparent" }}>
+              <span style={{ fontSize: 16 }}>{t.icon}</span>
+              <span style={{ fontSize: 10, letterSpacing: "0.15em" }}>{t.label}</span>
+            </button>
+          ))}
+        </nav>
+
+        {/* ホームからも追加できるように、予定追加ボタン(カレンダー以外でも) */}
+        {data && tab === "home" && (
+          <button style={S.fab} onClick={() => openNew()} aria-label="予定を追加">＋</button>
+        )}
+
+        {eventForm && (
+          <EventSheet initial={eventForm} onSave={saveEvent} onDelete={deleteEvent} onClose={() => setEventForm(null)} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- スタイル ---------- */
+
+const S = {
+  root: {
+    minHeight: "100vh",
+    background: "#1E4B39",
+    display: "flex",
+    justifyContent: "center",
+    fontFamily: "'Zen Kaku Gothic New', 'Hiragino Kaku Gothic ProN', sans-serif",
+    color: "#2A2620",
+  },
+  frame: {
+    width: "100%",
+    maxWidth: 480,
+    minHeight: "100vh",
+    background: "var(--paper)",
+    position: "relative",
+    display: "flex",
+    flexDirection: "column",
+    backgroundImage: "repeating-linear-gradient(0deg, rgba(42,38,32,0.02) 0 1px, transparent 1px 4px)",
+  },
+  header: {
+    background: "var(--green)",
+    color: "#F2EBD8",
+    padding: "12px 16px",
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    position: "sticky",
+    top: 0,
+    zIndex: 5,
+  },
+  main: { flex: 1, padding: "16px 14px 90px" },
+  tabbar: {
+    position: "fixed",
+    bottom: 0,
+    left: "50%",
+    transform: "translateX(-50%)",
+    width: "100%",
+    maxWidth: 480,
+    background: "var(--green)",
+    display: "flex",
+    zIndex: 10,
+    paddingBottom: "env(safe-area-inset-bottom)",
+  },
+  tabBtn: {
+    flex: 1,
+    background: "none",
+    border: "none",
+    color: "#F2EBD8",
+    padding: "8px 0 10px",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 2,
+  },
+  backupBanner: {
+    display: "block",
+    width: "100%",
+    background: "var(--shu)",
+    color: "#FBF6E9",
+    border: "none",
+    borderRadius: 6,
+    padding: "10px 12px",
+    fontSize: 13,
+    textAlign: "left",
+    marginBottom: 14,
+  },
+  himekuri: {
+    background: "#FBF6E9",
+    border: "1px solid var(--line)",
+    borderRadius: 6,
+    boxShadow: "0 2px 0 rgba(42,38,32,0.12)",
+    marginBottom: 18,
+    overflow: "hidden",
+  },
+  himekuriHoles: { display: "flex", justifyContent: "space-evenly", padding: "8px 20px 0" },
+  hole: { width: 7, height: 7, borderRadius: "50%", background: "var(--paper)", border: "1px solid var(--line)" },
+  sectionHead: {
+    fontFamily: "var(--mincho)",
+    fontSize: 14,
+    letterSpacing: "0.3em",
+    color: "var(--green)",
+    borderLeft: "4px solid var(--karashi)",
+    paddingLeft: 8,
+    margin: "18px 0 8px",
+  },
+  card: {
+    background: "#FBF6E9",
+    border: "1px solid var(--line)",
+    borderRadius: 6,
+    padding: "12px 14px",
+    marginBottom: 6,
+  },
+  empty: { fontSize: 13, color: "var(--faded)", padding: "10px 4px" },
+  remindTag: {
+    display: "inline-block",
+    color: "#F2EBD8",
+    fontSize: 11,
+    letterSpacing: "0.2em",
+    padding: "2px 10px",
+    borderRadius: 3,
+    marginBottom: 4,
+  },
+  eventRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    width: "100%",
+    background: "none",
+    border: "none",
+    borderBottom: "1px dashed var(--line)",
+    padding: "8px 2px",
+    fontSize: 14,
+    color: "var(--ink)",
+  },
+  calGrid: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 2 },
+  calHead: { textAlign: "center", fontSize: 11, padding: "2px 0 6px" },
+  calCell: { border: "none", background: "none", borderRadius: 4, padding: "6px 0 4px", minHeight: 44 },
+  navBtn: {
+    background: "none",
+    border: "1px solid var(--line)",
+    borderRadius: 4,
+    padding: "6px 12px",
+    fontSize: 13,
+    color: "var(--ink)",
+  },
+  primaryBtn: {
+    display: "block",
+    width: "100%",
+    background: "var(--green)",
+    color: "#F2EBD8",
+    border: "none",
+    borderRadius: 5,
+    padding: "12px 0",
+    fontSize: 14,
+    letterSpacing: "0.15em",
+    marginTop: 10,
+  },
+  dangerBtn: {
+    display: "block",
+    width: "100%",
+    background: "none",
+    color: "var(--shu)",
+    border: "1px solid var(--shu)",
+    borderRadius: 5,
+    padding: "10px 0",
+    fontSize: 13,
+    marginTop: 8,
+  },
+  iconBtn: { background: "none", border: "none", fontSize: 16, color: "var(--faded)", padding: 6 },
+  fab: {
+    position: "fixed",
+    right: "max(18px, calc(50% - 240px + 18px))",
+    bottom: 78,
+    width: 54,
+    height: 54,
+    borderRadius: "50%",
+    background: "var(--shu)",
+    color: "#FBF6E9",
+    border: "none",
+    fontSize: 26,
+    boxShadow: "0 3px 8px rgba(42,38,32,0.3)",
+    zIndex: 9,
+  },
+  sheetBack: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(42,38,32,0.45)",
+    zIndex: 20,
+    display: "flex",
+    alignItems: "flex-end",
+    justifyContent: "center",
+  },
+  sheet: {
+    width: "100%",
+    maxWidth: 480,
+    maxHeight: "88vh",
+    overflowY: "auto",
+    background: "var(--paper)",
+    borderRadius: "12px 12px 0 0",
+    paddingBottom: "env(safe-area-inset-bottom)",
+  },
+  sheetHead: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 18px 8px" },
+  sheetTitle: { fontFamily: "var(--mincho)", fontSize: 16, letterSpacing: "0.2em" },
+  fieldLabel: { fontSize: 12, color: "var(--faded)", letterSpacing: "0.15em", marginBottom: 4 },
+  input: {
+    width: "100%",
+    background: "#FBF6E9",
+    border: "1px solid var(--line)",
+    borderRadius: 5,
+    padding: "10px 12px",
+    fontSize: 14,
+    color: "var(--ink)",
+  },
+  memoCard: {
+    display: "block",
+    width: "100%",
+    background: "#FBF6E9",
+    border: "1px solid var(--line)",
+    borderRadius: 6,
+    padding: "10px 12px",
+    marginBottom: 8,
+    color: "var(--ink)",
+    fontSize: 14,
+  },
+  chip: {
+    border: "1px solid",
+    borderRadius: 999,
+    padding: "5px 12px",
+    fontSize: 12,
+    background: "transparent",
+  },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
